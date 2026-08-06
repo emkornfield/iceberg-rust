@@ -21,12 +21,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use iceberg::encryption::kms::{KeyManagementClient, KmsClientFactory};
 use iceberg::io::{FileIO, FileIOBuilder, StorageFactory};
 use iceberg::spec::{TableMetadata, TableMetadataBuilder};
 use iceberg::table::Table;
 use iceberg::{
     Catalog, CatalogBuilder, Error, ErrorKind, MetadataLocation, Namespace, NamespaceIdent, Result,
-    TableCommit, TableCreation, TableIdent,
+    Runtime, TableCommit, TableCreation, TableIdent,
 };
 use sqlx::any::{AnyPoolOptions, AnyQueryResult, AnyRow, install_default_drivers};
 use sqlx::{Any, AnyPool, Row, Transaction};
@@ -62,11 +63,35 @@ static MAX_CONNECTIONS: u32 = 10; // Default the SQL pool to 10 connections if n
 static IDLE_TIMEOUT: u64 = 10; // Default the maximum idle timeout per connection to 10s before it is closed
 static TEST_BEFORE_ACQUIRE: bool = true; // Default the health-check of each connection to enabled prior to returning
 
+fn parse_pool_property<T>(
+    props: &HashMap<String, String>,
+    property: &'static str,
+    default: T,
+) -> Result<T>
+where
+    T: FromStr,
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    props.get(property).map_or(Ok(default), |value| {
+        value.parse().map_err(|error| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "Failed to parse SQL catalog pool property",
+            )
+            .with_context("property", property)
+            .with_context("value", value)
+            .with_source(error)
+        })
+    })
+}
+
 /// Builder for [`SqlCatalog`]
 #[derive(Debug)]
 pub struct SqlCatalogBuilder {
     config: SqlCatalogConfig,
     storage_factory: Option<Arc<dyn StorageFactory>>,
+    kms_client_factory: Option<Arc<dyn KmsClientFactory>>,
+    runtime: Option<Runtime>,
 }
 
 impl Default for SqlCatalogBuilder {
@@ -80,6 +105,8 @@ impl Default for SqlCatalogBuilder {
                 props: HashMap::new(),
             },
             storage_factory: None,
+            kms_client_factory: None,
+            runtime: None,
         }
     }
 }
@@ -143,6 +170,16 @@ impl CatalogBuilder for SqlCatalogBuilder {
         self
     }
 
+    fn with_kms_client_factory(mut self, kms_client_factory: Arc<dyn KmsClientFactory>) -> Self {
+        self.kms_client_factory = Some(kms_client_factory);
+        self
+    }
+
+    fn with_runtime(mut self, runtime: Runtime) -> Self {
+        self.runtime = Some(runtime);
+        self
+    }
+
     fn load(
         mut self,
         name: impl Into<String>,
@@ -190,7 +227,15 @@ impl CatalogBuilder for SqlCatalogBuilder {
                 ))
             } else {
                 self.config.name = name;
-                SqlCatalog::new(self.config, self.storage_factory).await
+                let runtime = match self.runtime {
+                    Some(rt) => rt,
+                    None => Runtime::try_current()?,
+                };
+                let kms_client = match self.kms_client_factory {
+                    Some(factory) => Some(factory.create_kms_client(&self.config.props).await?),
+                    None => None,
+                };
+                SqlCatalog::new(self.config, self.storage_factory, runtime, kms_client).await
             }
         }
     }
@@ -221,6 +266,8 @@ pub struct SqlCatalog {
     warehouse_location: String,
     fileio: FileIO,
     sql_bind_style: SqlBindStyle,
+    runtime: Runtime,
+    kms_client: Option<Arc<dyn KeyManagementClient>>,
 }
 
 #[derive(Debug, PartialEq, strum::EnumString, strum::Display)]
@@ -237,6 +284,8 @@ impl SqlCatalog {
     async fn new(
         config: SqlCatalogConfig,
         storage_factory: Option<Arc<dyn StorageFactory>>,
+        runtime: Runtime,
+        kms_client: Option<Arc<dyn KeyManagementClient>>,
     ) -> Result<Self> {
         let factory = storage_factory.ok_or_else(|| {
             Error::new(
@@ -244,24 +293,21 @@ impl SqlCatalog {
                 "StorageFactory must be provided for SqlCatalog. Use `with_storage_factory` to configure it.",
             )
         })?;
-        let fileio = FileIOBuilder::new(factory).build();
+        // Forward catalog props so storage-backend keys reach the FileIO.
+        // Unrecognized keys are ignored by backends.
+        let fileio = FileIOBuilder::new(factory)
+            .with_props(config.props.clone())
+            .build();
 
         install_default_drivers();
-        let max_connections: u32 = config
-            .props
-            .get("pool.max-connections")
-            .map(|v| v.parse().unwrap())
-            .unwrap_or(MAX_CONNECTIONS);
-        let idle_timeout: u64 = config
-            .props
-            .get("pool.idle-timeout")
-            .map(|v| v.parse().unwrap())
-            .unwrap_or(IDLE_TIMEOUT);
-        let test_before_acquire: bool = config
-            .props
-            .get("pool.test-before-acquire")
-            .map(|v| v.parse().unwrap())
-            .unwrap_or(TEST_BEFORE_ACQUIRE);
+        let max_connections =
+            parse_pool_property(&config.props, "pool.max-connections", MAX_CONNECTIONS)?;
+        let idle_timeout = parse_pool_property(&config.props, "pool.idle-timeout", IDLE_TIMEOUT)?;
+        let test_before_acquire = parse_pool_property(
+            &config.props,
+            "pool.test-before-acquire",
+            TEST_BEFORE_ACQUIRE,
+        )?;
 
         let pool = AnyPoolOptions::new()
             .max_connections(max_connections)
@@ -303,6 +349,8 @@ impl SqlCatalog {
             warehouse_location: config.warehouse_location,
             fileio,
             sql_bind_style: config.sql_bind_style,
+            runtime,
+            kms_client,
         })
     }
 
@@ -434,7 +482,7 @@ impl Catalog for SqlCatalog {
 
         if exists {
             return Err(Error::new(
-                iceberg::ErrorKind::Unexpected,
+                ErrorKind::NamespaceAlreadyExists,
                 format!("Namespace {namespace:?} already exists"),
             ));
         }
@@ -584,7 +632,7 @@ impl Catalog for SqlCatalog {
             let mut tx = self.connection.begin().await.map_err(from_sqlx_error)?;
             let update_stmt = format!(
                 "UPDATE {NAMESPACE_TABLE_NAME} SET {NAMESPACE_FIELD_PROPERTY_VALUE} = ?
-                 WHERE {CATALOG_FIELD_CATALOG_NAME} = ? 
+                 WHERE {CATALOG_FIELD_CATALOG_NAME} = ?
                  AND {NAMESPACE_FIELD_NAME} = ?
                  AND {NAMESPACE_FIELD_PROPERTY_KEY} = ?"
             );
@@ -637,7 +685,7 @@ impl Catalog for SqlCatalog {
             let tables = self.list_tables(namespace).await?;
             if !tables.is_empty() {
                 return Err(Error::new(
-                    iceberg::ErrorKind::Unexpected,
+                    ErrorKind::Unexpected,
                     format!(
                         "Namespace {:?} is not empty. {} tables exist.",
                         namespace,
@@ -675,7 +723,7 @@ impl Catalog for SqlCatalog {
                          WHERE {CATALOG_FIELD_TABLE_NAMESPACE} = ?
                           AND {CATALOG_FIELD_CATALOG_NAME} = ?
                           AND (
-                                {CATALOG_FIELD_RECORD_TYPE} = '{CATALOG_FIELD_TABLE_RECORD_TYPE}' 
+                                {CATALOG_FIELD_RECORD_TYPE} = '{CATALOG_FIELD_TABLE_RECORD_TYPE}'
                                 OR {CATALOG_FIELD_RECORD_TYPE} IS NULL
                           )",
                     ),
@@ -714,7 +762,7 @@ impl Catalog for SqlCatalog {
                       AND {CATALOG_FIELD_CATALOG_NAME} = ?
                       AND {CATALOG_FIELD_TABLE_NAME} = ?
                       AND (
-                        {CATALOG_FIELD_RECORD_TYPE} = '{CATALOG_FIELD_TABLE_RECORD_TYPE}' 
+                        {CATALOG_FIELD_RECORD_TYPE} = '{CATALOG_FIELD_TABLE_RECORD_TYPE}'
                         OR {CATALOG_FIELD_RECORD_TYPE} IS NULL
                       )"
                 ),
@@ -741,7 +789,7 @@ impl Catalog for SqlCatalog {
                   AND {CATALOG_FIELD_TABLE_NAME} = ?
                   AND {CATALOG_FIELD_TABLE_NAMESPACE} = ?
                   AND (
-                    {CATALOG_FIELD_RECORD_TYPE} = '{CATALOG_FIELD_TABLE_RECORD_TYPE}' 
+                    {CATALOG_FIELD_RECORD_TYPE} = '{CATALOG_FIELD_TABLE_RECORD_TYPE}'
                     OR {CATALOG_FIELD_RECORD_TYPE} IS NULL
                   )"
             ),
@@ -755,6 +803,12 @@ impl Catalog for SqlCatalog {
         .await?;
 
         Ok(())
+    }
+
+    async fn purge_table(&self, table: &TableIdent) -> Result<()> {
+        let table_info = self.load_table(table).await?;
+        self.drop_table(table).await?;
+        iceberg::drop_table_data(&table_info).await
     }
 
     async fn load_table(&self, identifier: &TableIdent) -> Result<Table> {
@@ -771,7 +825,7 @@ impl Catalog for SqlCatalog {
                       AND {CATALOG_FIELD_TABLE_NAME} = ?
                       AND {CATALOG_FIELD_TABLE_NAMESPACE} = ?
                       AND (
-                        {CATALOG_FIELD_RECORD_TYPE} = '{CATALOG_FIELD_TABLE_RECORD_TYPE}' 
+                        {CATALOG_FIELD_RECORD_TYPE} = '{CATALOG_FIELD_TABLE_RECORD_TYPE}'
                         OR {CATALOG_FIELD_RECORD_TYPE} IS NULL
                       )"
                 ),
@@ -794,12 +848,16 @@ impl Catalog for SqlCatalog {
 
         let metadata = TableMetadata::read_from(&self.fileio, &tbl_metadata_location).await?;
 
-        Ok(Table::builder()
+        let mut builder = Table::builder()
             .file_io(self.fileio.clone())
             .identifier(identifier.clone())
             .metadata_location(tbl_metadata_location)
             .metadata(metadata)
-            .build()?)
+            .runtime(self.runtime.clone());
+        if let Some(kms_client) = self.kms_client.clone() {
+            builder = builder.kms_client(kms_client);
+        }
+        Ok(builder.build()?)
     }
 
     async fn create_table(
@@ -818,40 +876,35 @@ impl Catalog for SqlCatalog {
             return table_already_exists_err(&tbl_ident);
         }
 
-        let (tbl_creation, location) = match creation.location.clone() {
-            Some(location) => (creation, location),
-            None => {
-                // fall back to namespace-specific location
-                // and then to warehouse location
-                let nsp_properties = self.get_namespace(namespace).await?.properties().clone();
-                let nsp_location = match nsp_properties.get(NAMESPACE_LOCATION_PROPERTY_KEY) {
-                    Some(location) => location.clone(),
-                    None => {
-                        format!(
-                            "{}/{}",
-                            self.warehouse_location.clone(),
-                            namespace.join("/")
-                        )
-                    }
-                };
+        let tbl_creation = if creation.location.is_some() {
+            creation
+        } else {
+            // fall back to namespace-specific location
+            // and then to warehouse location
+            let nsp_properties = self.get_namespace(namespace).await?.properties().clone();
+            let nsp_location = match nsp_properties.get(NAMESPACE_LOCATION_PROPERTY_KEY) {
+                Some(location) => location.clone(),
+                None => {
+                    format!(
+                        "{}/{}",
+                        self.warehouse_location.clone(),
+                        namespace.join("/")
+                    )
+                }
+            };
 
-                let tbl_location = format!("{}/{}", nsp_location, tbl_ident.name());
+            let tbl_location = format!("{}/{}", nsp_location, tbl_ident.name());
 
-                (
-                    TableCreation {
-                        location: Some(tbl_location.clone()),
-                        ..creation
-                    },
-                    tbl_location,
-                )
+            TableCreation {
+                location: Some(tbl_location),
+                ..creation
             }
         };
 
         let tbl_metadata = TableMetadataBuilder::from_table_creation(tbl_creation)?
             .build()?
             .metadata;
-        let tbl_metadata_location =
-            MetadataLocation::new_with_metadata(location.clone(), &tbl_metadata);
+        let tbl_metadata_location = MetadataLocation::try_new_with_metadata(&tbl_metadata)?;
 
         tbl_metadata
             .write_to(&self.fileio, &tbl_metadata_location)
@@ -864,12 +917,16 @@ impl Catalog for SqlCatalog {
              VALUES (?, ?, ?, ?, ?)
             "), vec![Some(&self.name), Some(&namespace.join(".")), Some(&tbl_name.clone()), Some(&tbl_metadata_location_str), Some(CATALOG_FIELD_TABLE_RECORD_TYPE)], None).await?;
 
-        Ok(Table::builder()
+        let mut builder = Table::builder()
             .file_io(self.fileio.clone())
             .metadata_location(tbl_metadata_location_str)
             .identifier(tbl_ident)
             .metadata(tbl_metadata)
-            .build()?)
+            .runtime(self.runtime.clone());
+        if let Some(kms_client) = self.kms_client.clone() {
+            builder = builder.kms_client(kms_client);
+        }
+        Ok(builder.build()?)
     }
 
     async fn rename_table(&self, src: &TableIdent, dest: &TableIdent) -> Result<()> {
@@ -935,12 +992,16 @@ impl Catalog for SqlCatalog {
              VALUES (?, ?, ?, ?, ?)
             "), vec![Some(&self.name), Some(&namespace.join(".")), Some(&tbl_name), Some(&metadata_location), Some(CATALOG_FIELD_TABLE_RECORD_TYPE)], None).await?;
 
-        Ok(Table::builder()
+        let mut builder = Table::builder()
             .identifier(table_ident.clone())
             .metadata_location(metadata_location)
             .metadata(metadata)
             .file_io(self.fileio.clone())
-            .build()?)
+            .runtime(self.runtime.clone());
+        if let Some(kms_client) = self.kms_client.clone() {
+            builder = builder.kms_client(kms_client);
+        }
+        Ok(builder.build()?)
     }
 
     /// Updates an existing table within the SQL catalog.
@@ -1006,8 +1067,9 @@ mod tests {
     use iceberg::io::LocalFsStorageFactory;
     use iceberg::spec::{NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder, Type};
     use iceberg::table::Table;
-    use iceberg::transaction::{ApplyTransactionAction, Transaction};
-    use iceberg::{Catalog, CatalogBuilder, Namespace, NamespaceIdent, TableCreation, TableIdent};
+    use iceberg::{
+        Catalog, CatalogBuilder, ErrorKind, Namespace, NamespaceIdent, TableCreation, TableIdent,
+    };
     use itertools::Itertools;
     use regex::Regex;
     use sqlx::migrate::MigrateDatabase;
@@ -1026,7 +1088,7 @@ mod tests {
         temp_dir.path().to_str().unwrap().to_string()
     }
 
-    fn to_set<T: std::cmp::Eq + Hash>(vec: Vec<T>) -> HashSet<T> {
+    fn to_set<T: Eq + Hash>(vec: Vec<T>) -> HashSet<T> {
         HashSet::from_iter(vec)
     }
 
@@ -1156,6 +1218,33 @@ mod tests {
         // catalog instantiation should not fail even if tables exist
         new_sql_catalog(warehouse_loc.clone(), Some("iceberg")).await;
         new_sql_catalog(warehouse_loc.clone(), Some("iceberg")).await;
+    }
+
+    // Regression test: storage-backend props set on the catalog must reach
+    // the FileIO; otherwise authenticated backends fail with 401s on writes.
+    #[tokio::test]
+    async fn test_storage_props_propagate_to_file_io() {
+        let sql_lite_uri = format!("sqlite:{}", temp_path());
+        sqlx::Sqlite::create_database(&sql_lite_uri).await.unwrap();
+        let warehouse_location = temp_path();
+
+        let catalog = SqlCatalogBuilder::default()
+            .with_storage_factory(Arc::new(LocalFsStorageFactory))
+            .load(
+                "iceberg",
+                HashMap::from_iter([
+                    (SQL_CATALOG_PROP_URI.to_string(), sql_lite_uri),
+                    (SQL_CATALOG_PROP_WAREHOUSE.to_string(), warehouse_location),
+                    ("s3.region".to_string(), "us-east-1".to_string()),
+                    ("hf.token".to_string(), "hf_test_token".to_string()),
+                ]),
+            )
+            .await
+            .unwrap();
+
+        let props = catalog.fileio.config().props();
+        assert_eq!(props.get("s3.region"), Some(&"us-east-1".to_string()));
+        assert_eq!(props.get("hf.token"), Some(&"hf_test_token".to_string()));
     }
 
     #[tokio::test]
@@ -1363,6 +1452,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_builder_props_invalid_pool_property_fails() {
+        for property in [
+            "pool.max-connections",
+            "pool.idle-timeout",
+            "pool.test-before-acquire",
+        ] {
+            let error = SqlCatalogBuilder::default()
+                .with_storage_factory(Arc::new(LocalFsStorageFactory))
+                .prop(property, "invalid")
+                .load("iceberg", HashMap::new())
+                .await
+                .unwrap_err();
+
+            assert_eq!(error.kind(), ErrorKind::DataInvalid);
+            assert!(error.to_string().contains(property));
+            assert!(error.to_string().contains("invalid"));
+        }
+    }
+
+    #[tokio::test]
     async fn test_list_namespaces_returns_empty_vector() {
         let warehouse_loc = temp_path();
         let catalog = new_sql_catalog(warehouse_loc, Some("iceberg")).await;
@@ -1384,20 +1493,6 @@ mod tests {
 
         let catalog2 = new_sql_catalog(warehouse_loc, Some("test")).await;
         assert_eq!(catalog2.list_namespaces(None).await.unwrap(), vec![]);
-    }
-
-    #[tokio::test]
-    async fn test_list_namespaces_returns_multiple_namespaces() {
-        let warehouse_loc = temp_path();
-        let catalog = new_sql_catalog(warehouse_loc, Some("iceberg")).await;
-        let namespace_ident_1 = NamespaceIdent::new("a".into());
-        let namespace_ident_2 = NamespaceIdent::new("b".into());
-        create_namespaces(&catalog, &vec![&namespace_ident_1, &namespace_ident_2]).await;
-
-        assert_eq!(
-            to_set(catalog.list_namespaces(None).await.unwrap()),
-            to_set(vec![namespace_ident_1, namespace_ident_2])
-        );
     }
 
     #[tokio::test]
@@ -1547,31 +1642,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_namespace_throws_error_if_namespace_already_exists() {
-        let warehouse_loc = temp_path();
-        let catalog = new_sql_catalog(warehouse_loc, Some("iceberg")).await;
-        let namespace_ident = NamespaceIdent::new("a".into());
-        create_namespace(&catalog, &namespace_ident).await;
-
-        assert_eq!(
-            catalog
-                .create_namespace(&namespace_ident, HashMap::new())
-                .await
-                .unwrap_err()
-                .to_string(),
-            format!(
-                "Unexpected => Namespace {:?} already exists",
-                &namespace_ident
-            )
-        );
-
-        assert_eq!(
-            catalog.get_namespace(&namespace_ident).await.unwrap(),
-            Namespace::with_properties(namespace_ident, default_properties())
-        );
-    }
-
-    #[tokio::test]
     async fn test_create_nested_namespace() {
         let warehouse_loc = temp_path();
         let catalog = new_sql_catalog(warehouse_loc, Some("iceberg")).await;
@@ -1641,35 +1711,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_namespace() {
-        let warehouse_loc = temp_path();
-        let catalog = new_sql_catalog(warehouse_loc, Some("iceberg")).await;
-        let namespace_ident = NamespaceIdent::new("a".into());
-        create_namespace(&catalog, &namespace_ident).await;
-
-        let mut props = HashMap::from_iter([
-            ("prop1".to_string(), "val1".to_string()),
-            ("prop2".into(), "val2".into()),
-        ]);
-
-        catalog
-            .update_namespace(&namespace_ident, props.clone())
-            .await
-            .unwrap();
-
-        props.insert("exists".into(), "true".into());
-
-        assert_eq!(
-            *catalog
-                .get_namespace(&namespace_ident)
-                .await
-                .unwrap()
-                .properties(),
-            props
-        )
-    }
-
-    #[tokio::test]
     async fn test_update_nested_namespace() {
         let warehouse_loc = temp_path();
         let catalog = new_sql_catalog(warehouse_loc, Some("iceberg")).await;
@@ -1699,28 +1740,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_namespace_errors_if_namespace_doesnt_exist() {
-        let warehouse_loc = temp_path();
-        let catalog = new_sql_catalog(warehouse_loc, Some("iceberg")).await;
-        let namespace_ident = NamespaceIdent::new("a".into());
-
-        let props = HashMap::from_iter([
-            ("prop1".to_string(), "val1".to_string()),
-            ("prop2".into(), "val2".into()),
-        ]);
-
-        let err = catalog
-            .update_namespace(&namespace_ident, props)
-            .await
-            .unwrap_err();
-
-        assert_eq!(
-            err.message(),
-            format!("No such namespace: {namespace_ident:?}")
-        );
-    }
-
-    #[tokio::test]
     async fn test_update_namespace_errors_if_nested_namespace_doesnt_exist() {
         let warehouse_loc = temp_path();
         let catalog = new_sql_catalog(warehouse_loc, Some("iceberg")).await;
@@ -1740,18 +1759,6 @@ mod tests {
             err.message(),
             format!("No such namespace: {namespace_ident:?}")
         );
-    }
-
-    #[tokio::test]
-    async fn test_drop_namespace() {
-        let warehouse_loc = temp_path();
-        let catalog = new_sql_catalog(warehouse_loc, Some("iceberg")).await;
-        let namespace_ident = NamespaceIdent::new("abc".into());
-        create_namespace(&catalog, &namespace_ident).await;
-
-        catalog.drop_namespace(&namespace_ident).await.unwrap();
-
-        assert!(!catalog.namespace_exists(&namespace_ident).await.unwrap())
     }
 
     #[tokio::test]
@@ -1811,22 +1818,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_drop_namespace_throws_error_if_namespace_doesnt_exist() {
-        let warehouse_loc = temp_path();
-        let catalog = new_sql_catalog(warehouse_loc, Some("iceberg")).await;
-
-        let non_existent_namespace_ident = NamespaceIdent::new("abc".into());
-        assert_eq!(
-            catalog
-                .drop_namespace(&non_existent_namespace_ident)
-                .await
-                .unwrap_err()
-                .to_string(),
-            format!("Unexpected => No such namespace: {non_existent_namespace_ident:?}")
-        )
-    }
-
-    #[tokio::test]
     async fn test_drop_namespace_throws_error_if_nested_namespace_doesnt_exist() {
         let warehouse_loc = temp_path();
         let catalog = new_sql_catalog(warehouse_loc, Some("iceberg")).await;
@@ -1840,7 +1831,7 @@ mod tests {
                 .await
                 .unwrap_err()
                 .to_string(),
-            format!("Unexpected => No such namespace: {non_existent_namespace_ident:?}")
+            format!("NamespaceNotFound => No such namespace: {non_existent_namespace_ident:?}")
         )
     }
 
@@ -1862,72 +1853,6 @@ mod tests {
                 .await
                 .unwrap()
         );
-    }
-
-    #[tokio::test]
-    async fn test_list_tables_returns_empty_vector() {
-        let warehouse_loc = temp_path();
-        let catalog = new_sql_catalog(warehouse_loc, Some("iceberg")).await;
-        let namespace_ident = NamespaceIdent::new("a".into());
-        create_namespace(&catalog, &namespace_ident).await;
-
-        assert_eq!(catalog.list_tables(&namespace_ident).await.unwrap(), vec![]);
-    }
-
-    #[tokio::test]
-    async fn test_list_tables_throws_error_if_namespace_doesnt_exist() {
-        let warehouse_loc = temp_path();
-        let catalog = new_sql_catalog(warehouse_loc, Some("iceberg")).await;
-
-        let non_existent_namespace_ident = NamespaceIdent::new("n1".into());
-
-        assert_eq!(
-            catalog
-                .list_tables(&non_existent_namespace_ident)
-                .await
-                .unwrap_err()
-                .to_string(),
-            format!("Unexpected => No such namespace: {non_existent_namespace_ident:?}"),
-        );
-    }
-
-    #[tokio::test]
-    async fn test_create_table_with_location() {
-        let warehouse_loc = temp_path();
-        let catalog = new_sql_catalog(warehouse_loc.clone(), Some("iceberg")).await;
-        let namespace_ident = NamespaceIdent::new("a".into());
-        create_namespace(&catalog, &namespace_ident).await;
-
-        let table_name = "abc";
-        let location = warehouse_loc.clone();
-        let table_creation = TableCreation::builder()
-            .name(table_name.into())
-            .location(location.clone())
-            .schema(simple_table_schema())
-            .build();
-
-        let expected_table_ident = TableIdent::new(namespace_ident.clone(), table_name.into());
-
-        assert_table_eq(
-            &catalog
-                .create_table(&namespace_ident, table_creation)
-                .await
-                .unwrap(),
-            &expected_table_ident,
-            &simple_table_schema(),
-        );
-
-        let table = catalog.load_table(&expected_table_ident).await.unwrap();
-
-        assert_table_eq(&table, &expected_table_ident, &simple_table_schema());
-
-        assert!(
-            table
-                .metadata_location()
-                .unwrap()
-                .to_string()
-                .starts_with(&location)
-        )
     }
 
     #[tokio::test]
@@ -2128,54 +2053,10 @@ mod tests {
                 .await
                 .unwrap_err()
                 .to_string(),
-            format!("Unexpected => Table {:?} already exists.", &table_ident)
-        );
-    }
-
-    #[tokio::test]
-    async fn test_rename_table_in_same_namespace() {
-        let warehouse_loc = temp_path();
-        let catalog = new_sql_catalog(warehouse_loc, Some("iceberg")).await;
-        let namespace_ident = NamespaceIdent::new("n1".into());
-        create_namespace(&catalog, &namespace_ident).await;
-        let src_table_ident = TableIdent::new(namespace_ident.clone(), "tbl1".into());
-        let dst_table_ident = TableIdent::new(namespace_ident.clone(), "tbl2".into());
-        create_table(&catalog, &src_table_ident).await;
-
-        catalog
-            .rename_table(&src_table_ident, &dst_table_ident)
-            .await
-            .unwrap();
-
-        assert_eq!(catalog.list_tables(&namespace_ident).await.unwrap(), vec![
-            dst_table_ident
-        ],);
-    }
-
-    #[tokio::test]
-    async fn test_rename_table_across_namespaces() {
-        let warehouse_loc = temp_path();
-        let catalog = new_sql_catalog(warehouse_loc, Some("iceberg")).await;
-        let src_namespace_ident = NamespaceIdent::new("a".into());
-        let dst_namespace_ident = NamespaceIdent::new("b".into());
-        create_namespaces(&catalog, &vec![&src_namespace_ident, &dst_namespace_ident]).await;
-        let src_table_ident = TableIdent::new(src_namespace_ident.clone(), "tbl1".into());
-        let dst_table_ident = TableIdent::new(dst_namespace_ident.clone(), "tbl2".into());
-        create_table(&catalog, &src_table_ident).await;
-
-        catalog
-            .rename_table(&src_table_ident, &dst_table_ident)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            catalog.list_tables(&src_namespace_ident).await.unwrap(),
-            vec![],
-        );
-
-        assert_eq!(
-            catalog.list_tables(&dst_namespace_ident).await.unwrap(),
-            vec![dst_table_ident],
+            format!(
+                "TableAlreadyExists => Table {:?} already exists.",
+                &table_ident
+            )
         );
     }
 
@@ -2244,213 +2125,7 @@ mod tests {
                 .await
                 .unwrap_err()
                 .to_string(),
-            format!("Unexpected => No such namespace: {non_existent_dst_namespace_ident:?}"),
-        );
-    }
-
-    #[tokio::test]
-    async fn test_rename_table_throws_error_if_src_table_doesnt_exist() {
-        let warehouse_loc = temp_path();
-        let catalog = new_sql_catalog(warehouse_loc, Some("iceberg")).await;
-        let namespace_ident = NamespaceIdent::new("n1".into());
-        create_namespace(&catalog, &namespace_ident).await;
-        let src_table_ident = TableIdent::new(namespace_ident.clone(), "tbl1".into());
-        let dst_table_ident = TableIdent::new(namespace_ident.clone(), "tbl2".into());
-
-        assert_eq!(
-            catalog
-                .rename_table(&src_table_ident, &dst_table_ident)
-                .await
-                .unwrap_err()
-                .to_string(),
-            format!("Unexpected => No such table: {src_table_ident:?}"),
-        );
-    }
-
-    #[tokio::test]
-    async fn test_rename_table_throws_error_if_dst_table_already_exists() {
-        let warehouse_loc = temp_path();
-        let catalog = new_sql_catalog(warehouse_loc, Some("iceberg")).await;
-        let namespace_ident = NamespaceIdent::new("n1".into());
-        create_namespace(&catalog, &namespace_ident).await;
-        let src_table_ident = TableIdent::new(namespace_ident.clone(), "tbl1".into());
-        let dst_table_ident = TableIdent::new(namespace_ident.clone(), "tbl2".into());
-        create_tables(&catalog, vec![&src_table_ident, &dst_table_ident]).await;
-
-        assert_eq!(
-            catalog
-                .rename_table(&src_table_ident, &dst_table_ident)
-                .await
-                .unwrap_err()
-                .to_string(),
-            format!("Unexpected => Table {:?} already exists.", &dst_table_ident),
-        );
-    }
-
-    #[tokio::test]
-    async fn test_drop_table_throws_error_if_table_not_exist() {
-        let warehouse_loc = temp_path();
-        let catalog = new_sql_catalog(warehouse_loc.clone(), Some("iceberg")).await;
-        let namespace_ident = NamespaceIdent::new("a".into());
-        let table_name = "tbl1";
-        let table_ident = TableIdent::new(namespace_ident.clone(), table_name.into());
-        create_namespace(&catalog, &namespace_ident).await;
-
-        let err = catalog
-            .drop_table(&table_ident)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            err,
-            "Unexpected => No such table: TableIdent { namespace: NamespaceIdent([\"a\"]), name: \"tbl1\" }"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_drop_table() {
-        let warehouse_loc = temp_path();
-        let catalog = new_sql_catalog(warehouse_loc.clone(), Some("iceberg")).await;
-        let namespace_ident = NamespaceIdent::new("a".into());
-        let table_name = "tbl1";
-        let table_ident = TableIdent::new(namespace_ident.clone(), table_name.into());
-        create_namespace(&catalog, &namespace_ident).await;
-
-        let location = warehouse_loc.clone();
-        let table_creation = TableCreation::builder()
-            .name(table_name.into())
-            .location(location.clone())
-            .schema(simple_table_schema())
-            .build();
-
-        catalog
-            .create_table(&namespace_ident, table_creation)
-            .await
-            .unwrap();
-
-        let table = catalog.load_table(&table_ident).await.unwrap();
-        assert_table_eq(&table, &table_ident, &simple_table_schema());
-
-        catalog.drop_table(&table_ident).await.unwrap();
-        let err = catalog
-            .load_table(&table_ident)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            err,
-            "Unexpected => No such table: TableIdent { namespace: NamespaceIdent([\"a\"]), name: \"tbl1\" }"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_register_table_throws_error_if_table_with_same_name_already_exists() {
-        let warehouse_loc = temp_path();
-        let catalog = new_sql_catalog(warehouse_loc.clone(), Some("iceberg")).await;
-        let namespace_ident = NamespaceIdent::new("a".into());
-        create_namespace(&catalog, &namespace_ident).await;
-        let table_name = "tbl1";
-        let table_ident = TableIdent::new(namespace_ident.clone(), table_name.into());
-        create_table(&catalog, &table_ident).await;
-
-        assert_eq!(
-            catalog
-                .register_table(&table_ident, warehouse_loc)
-                .await
-                .unwrap_err()
-                .to_string(),
-            format!("Unexpected => Table {:?} already exists.", &table_ident)
-        );
-    }
-
-    #[tokio::test]
-    async fn test_register_table() {
-        let warehouse_loc = temp_path();
-        let catalog = new_sql_catalog(warehouse_loc.clone(), Some("iceberg")).await;
-        let namespace_ident = NamespaceIdent::new("a".into());
-        create_namespace(&catalog, &namespace_ident).await;
-
-        let table_name = "abc";
-        let location = warehouse_loc.clone();
-        let table_creation = TableCreation::builder()
-            .name(table_name.into())
-            .location(location.clone())
-            .schema(simple_table_schema())
-            .build();
-
-        let table_ident = TableIdent::new(namespace_ident.clone(), table_name.into());
-        let expected_table = catalog
-            .create_table(&namespace_ident, table_creation)
-            .await
-            .unwrap();
-
-        let metadata_location = expected_table
-            .metadata_location()
-            .expect("Expected metadata location to be set")
-            .to_string();
-
-        assert_table_eq(&expected_table, &table_ident, &simple_table_schema());
-
-        let _ = catalog.drop_table(&table_ident).await;
-
-        let table = catalog
-            .register_table(&table_ident, metadata_location.clone())
-            .await
-            .unwrap();
-
-        assert_eq!(table.identifier(), expected_table.identifier());
-        assert_eq!(table.metadata_location(), Some(metadata_location.as_str()));
-    }
-
-    #[tokio::test]
-    async fn test_update_table() {
-        let warehouse_loc = temp_path();
-        let catalog = new_sql_catalog(warehouse_loc, Some("iceberg")).await;
-
-        // Create a test namespace and table
-        let namespace_ident = NamespaceIdent::new("ns1".into());
-        create_namespace(&catalog, &namespace_ident).await;
-        let table_ident = TableIdent::new(namespace_ident.clone(), "tbl1".into());
-        create_table(&catalog, &table_ident).await;
-
-        let table = catalog.load_table(&table_ident).await.unwrap();
-
-        // Store the original metadata location for comparison
-        let original_metadata_location = table.metadata_location().unwrap().to_string();
-
-        // Create a transaction to update the table
-        let tx = Transaction::new(&table);
-        let tx = tx
-            .update_table_properties()
-            .set("test_property".to_string(), "test_value".to_string())
-            .apply(tx)
-            .unwrap();
-
-        // Commit the transaction to the catalog
-        let updated_table = tx.commit(&catalog).await.unwrap();
-
-        // Verify the update was successful
-        assert_eq!(
-            updated_table.metadata().properties().get("test_property"),
-            Some(&"test_value".to_string())
-        );
-        // Verify the metadata location has been updated
-        assert_ne!(
-            updated_table.metadata_location().unwrap(),
-            original_metadata_location.as_str()
-        );
-
-        // Load the table again from the catalog to verify changes were persisted
-        let reloaded = catalog.load_table(&table_ident).await.unwrap();
-
-        // Verify the reloaded table matches the updated table
-        assert_eq!(
-            reloaded.metadata().properties().get("test_property"),
-            Some(&"test_value".to_string())
-        );
-        assert_eq!(
-            reloaded.metadata_location(),
-            updated_table.metadata_location()
+            format!("NamespaceNotFound => No such namespace: {non_existent_dst_namespace_ident:?}"),
         );
     }
 }

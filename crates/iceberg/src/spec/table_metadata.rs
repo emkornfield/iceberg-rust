@@ -37,7 +37,7 @@ use super::{
     SnapshotRef, SnapshotRetention, SortOrder, SortOrderRef, StatisticsFile, StructType,
     TableProperties, parse_metadata_file_compression,
 };
-use crate::catalog::MetadataLocation;
+use crate::catalog::{METADATA_FOLDER_NAME, MetadataLocation};
 use crate::compression::CompressionCodec;
 use crate::error::{Result, timestamp_ms_to_utc};
 use crate::io::FileIO;
@@ -47,6 +47,9 @@ use crate::{Error, ErrorKind};
 static MAIN_BRANCH: &str = "main";
 pub(crate) static ONE_MINUTE_MS: i64 = 60_000;
 
+/// Sentinel value used by the Java implementation and older metadata files
+/// to represent a missing/empty current snapshot ID. During deserialization,
+/// this value is normalized to `None`.
 pub(crate) static EMPTY_SNAPSHOT_ID: i64 = -1;
 pub(crate) static INITIAL_SEQUENCE_NUMBER: i64 = 0;
 
@@ -361,6 +364,17 @@ impl TableMetadata {
         &self.properties
     }
 
+    /// Returns the base location for metadata files (manifests, manifest lists).
+    ///
+    /// Honors the `write.metadata.path` table property when set, otherwise defaults
+    /// to the `metadata` subdirectory under the table location.
+    pub fn metadata_location(&self) -> Result<String> {
+        Ok(self
+            .table_properties()?
+            .write_metadata_path
+            .unwrap_or_else(|| format!("{}/{}", self.location(), METADATA_FOLDER_NAME)))
+    }
+
     /// Returns the metadata compression codec from table properties.
     ///
     /// Returns `CompressionCodec::None` if compression is disabled or not configured.
@@ -457,7 +471,7 @@ impl TableMetadata {
             && metadata_content[0] == 0x1F
             && metadata_content[1] == 0x8B
         {
-            let decompressed_data = CompressionCodec::Gzip
+            let decompressed_data = CompressionCodec::gzip_default()
                 .decompress(metadata_content.to_vec())
                 .map_err(|e| {
                     Error::new(
@@ -499,7 +513,7 @@ impl TableMetadata {
 
         // Apply compression based on codec
         let data_to_write = match codec {
-            CompressionCodec::Gzip => codec.compress(json_data)?,
+            CompressionCodec::Gzip(_) => codec.compress(json_data)?,
             CompressionCodec::None => json_data,
             _ => {
                 return Err(Error::new(
@@ -532,6 +546,7 @@ impl TableMetadata {
         // Normalize location (remove trailing slash)
         self.location = self.location.trim_end_matches('/').to_string();
         self.validate_snapshot_sequence_number()?;
+        self.validate_schema_format_compatibility()?;
         self.try_normalize_partition_spec()?;
         self.try_normalize_sort_order()?;
         Ok(self)
@@ -746,6 +761,13 @@ impl TableMetadata {
 
         Ok(())
     }
+
+    /// Validates that every type used in the current schema is supported by the
+    /// table's format version.  Delegates to [`Schema::check_format_compatibility`].
+    fn validate_schema_format_compatibility(&self) -> Result<()> {
+        self.current_schema()
+            .check_format_compatibility(self.format_version)
+    }
 }
 
 pub(super) mod _serde {
@@ -765,8 +787,8 @@ pub(super) mod _serde {
     use uuid::Uuid;
 
     use super::{
-        DEFAULT_PARTITION_SPEC_ID, FormatVersion, MAIN_BRANCH, MetadataLog, SnapshotLog,
-        TableMetadata,
+        DEFAULT_PARTITION_SPEC_ID, EMPTY_SNAPSHOT_ID, FormatVersion, MAIN_BRANCH, MetadataLog,
+        SnapshotLog, TableMetadata,
     };
     use crate::spec::schema::_serde::{SchemaV1, SchemaV2};
     use crate::spec::snapshot::_serde::{SnapshotV1, SnapshotV2, SnapshotV3};
@@ -942,7 +964,7 @@ pub(super) mod _serde {
 
     impl TryFrom<TableMetadataV3> for TableMetadata {
         type Error = Error;
-        fn try_from(value: TableMetadataV3) -> Result<Self, self::Error> {
+        fn try_from(value: TableMetadataV3) -> Result<Self, Error> {
             let TableMetadataV3 {
                 format_version: _,
                 shared: value,
@@ -950,7 +972,7 @@ pub(super) mod _serde {
                 encryption_keys,
                 snapshots,
             } = value;
-            let current_snapshot_id = if let &Some(-1) = &value.current_snapshot_id {
+            let current_snapshot_id = if value.current_snapshot_id == Some(EMPTY_SNAPSHOT_ID) {
                 None
             } else {
                 value.current_snapshot_id
@@ -1060,10 +1082,10 @@ pub(super) mod _serde {
 
     impl TryFrom<TableMetadataV2> for TableMetadata {
         type Error = Error;
-        fn try_from(value: TableMetadataV2) -> Result<Self, self::Error> {
+        fn try_from(value: TableMetadataV2) -> Result<Self, Error> {
             let snapshots = value.snapshots;
             let value = value.shared;
-            let current_snapshot_id = if let &Some(-1) = &value.current_snapshot_id {
+            let current_snapshot_id = if value.current_snapshot_id == Some(EMPTY_SNAPSHOT_ID) {
                 None
             } else {
                 value.current_snapshot_id
@@ -1170,7 +1192,7 @@ pub(super) mod _serde {
     impl TryFrom<TableMetadataV1> for TableMetadata {
         type Error = Error;
         fn try_from(value: TableMetadataV1) -> Result<Self, Error> {
-            let current_snapshot_id = if let &Some(-1) = &value.current_snapshot_id {
+            let current_snapshot_id = if value.current_snapshot_id == Some(EMPTY_SNAPSHOT_ID) {
                 None
             } else {
                 value.current_snapshot_id
@@ -1635,6 +1657,16 @@ mod tests {
         let metadata: String = fs::read_to_string(path).unwrap();
 
         serde_json::from_str(&metadata).unwrap()
+    }
+
+    /// Loads a test table metadata and relocates it to `location`, so that derived
+    /// metadata paths point at a writable (e.g. temp) directory.
+    fn get_test_table_metadata_at(file_name: &str, location: &str) -> TableMetadata {
+        TableMetadataBuilder::new_from_metadata(get_test_table_metadata(file_name), None)
+            .set_location(location.to_string())
+            .build()
+            .unwrap()
+            .metadata
     }
 
     #[test]
@@ -3301,6 +3333,18 @@ mod tests {
     }
 
     #[test]
+    fn test_empty_snapshot_id_is_normalized_to_none() {
+        let metadata =
+            fs::read_to_string("testdata/table_metadata/TableMetadataV1Valid.json").unwrap();
+        let deserialized: TableMetadata = serde_json::from_str(&metadata).unwrap();
+        assert_eq!(
+            deserialized.current_snapshot_id(),
+            None,
+            "current_snapshot_id of -1 should be deserialized as None"
+        );
+    }
+
+    #[test]
     fn test_table_metadata_v1_compat() {
         let metadata =
             fs::read_to_string("testdata/table_metadata/TableMetadataV1Compat.json").unwrap();
@@ -3586,10 +3630,12 @@ mod tests {
         let file_io = FileIO::new_with_fs();
 
         // Use an existing test metadata from the test files
-        let original_metadata: TableMetadata = get_test_table_metadata("TableMetadataV2Valid.json");
+        let original_metadata: TableMetadata =
+            get_test_table_metadata_at("TableMetadataV2Valid.json", temp_path);
 
         // Define the metadata location
-        let metadata_location = MetadataLocation::new_with_metadata(temp_path, &original_metadata);
+        let metadata_location =
+            MetadataLocation::try_new_with_metadata(&original_metadata).unwrap();
         let metadata_location_str = metadata_location.to_string();
 
         // Write the metadata
@@ -3618,10 +3664,10 @@ mod tests {
         let original_metadata: TableMetadata = get_test_table_metadata("TableMetadataV2Valid.json");
         let json = serde_json::to_string(&original_metadata).unwrap();
 
-        let compressed = CompressionCodec::Gzip
+        let compressed = CompressionCodec::gzip_default()
             .compress(json.into_bytes())
             .expect("failed to compress metadata");
-        std::fs::write(&metadata_location, &compressed).expect("failed to write metadata");
+        fs::write(&metadata_location, &compressed).expect("failed to write metadata");
 
         // Read the metadata back
         let file_io = FileIO::new_with_fs();
@@ -3653,7 +3699,8 @@ mod tests {
         let file_io = FileIO::new_with_fs();
 
         // Get a test metadata and add gzip compression property
-        let original_metadata: TableMetadata = get_test_table_metadata("TableMetadataV2Valid.json");
+        let original_metadata: TableMetadata =
+            get_test_table_metadata_at("TableMetadataV2Valid.json", temp_path);
 
         // Modify properties to enable gzip compression (using mixed case to test case-insensitive matching)
         let mut props = original_metadata.properties.clone();
@@ -3673,7 +3720,7 @@ mod tests {
 
         // Create MetadataLocation with compression codec from metadata
         let metadata_location =
-            MetadataLocation::new_with_metadata(temp_path, &compressed_metadata);
+            MetadataLocation::try_new_with_metadata(&compressed_metadata).unwrap();
         let metadata_location_str = metadata_location.to_string();
 
         // Verify the location has the .gz extension
@@ -3689,7 +3736,7 @@ mod tests {
         assert!(std::path::Path::new(&metadata_location_str).exists());
 
         // Read the raw file and check it's gzip compressed
-        let raw_content = std::fs::read(&metadata_location_str).unwrap();
+        let raw_content = fs::read(&metadata_location_str).unwrap();
         assert!(raw_content.len() > 2);
         assert_eq!(raw_content[0], 0x1F); // gzip magic number
         assert_eq!(raw_content[1], 0x8B); // gzip magic number
@@ -4267,5 +4314,53 @@ mod tests {
             deserialized_snapshot.row_range().unwrap();
         assert_eq!(deserialized_first_row_id, 100);
         assert_eq!(deserialized_added_rows, 50);
+    }
+
+    #[test]
+    fn test_metadata_location_default() {
+        // Verify metadata files go to `<location>/metadata` when `write.metadata.path` is not set
+        let metadata = get_test_table_metadata("TableMetadataV2Valid.json");
+        assert_eq!(metadata.location(), "s3://bucket/test/location");
+        assert_eq!(
+            metadata.metadata_location().unwrap(),
+            "s3://bucket/test/location/metadata"
+        );
+    }
+
+    #[test]
+    fn test_metadata_location_honors_write_metadata_path() {
+        let metadata = get_test_table_metadata("TableMetadataV2Valid.json")
+            .into_builder(None)
+            .set_properties(HashMap::from([(
+                TableProperties::PROPERTY_WRITE_METADATA_PATH.to_string(),
+                "s3://other-bucket/custom-meta".to_string(),
+            )]))
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        assert_eq!(
+            metadata.metadata_location().unwrap(),
+            "s3://other-bucket/custom-meta"
+        );
+    }
+
+    #[test]
+    fn test_metadata_location_trims_trailing_slash() {
+        // A configured path with a trailing slash must not yield a doubled separator
+        let metadata = get_test_table_metadata("TableMetadataV2Valid.json")
+            .into_builder(None)
+            .set_properties(HashMap::from([(
+                TableProperties::PROPERTY_WRITE_METADATA_PATH.to_string(),
+                "s3://other-bucket/custom-meta/".to_string(),
+            )]))
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        assert_eq!(
+            metadata.metadata_location().unwrap(),
+            "s3://other-bucket/custom-meta"
+        );
     }
 }

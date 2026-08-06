@@ -19,6 +19,8 @@
 
 pub mod memory;
 mod metadata_location;
+mod session;
+pub(crate) mod utils;
 
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
@@ -35,10 +37,13 @@ pub use metadata_location::*;
 #[cfg(test)]
 use mockall::automock;
 use serde_derive::{Deserialize, Serialize};
+pub use session::*;
 use typed_builder::TypedBuilder;
 use uuid::Uuid;
 
+use crate::encryption::kms::KmsClientFactory;
 use crate::io::StorageFactory;
+use crate::runtime::Runtime;
 use crate::spec::{
     EncryptedKey, FormatVersion, PartitionStatisticsFile, Schema, SchemaId, Snapshot,
     SnapshotReference, SortOrder, StatisticsFile, TableMetadata, TableMetadataBuilder,
@@ -98,6 +103,14 @@ pub trait Catalog: Debug + Sync + Send {
     /// Drop a table from the catalog, or returns error if it doesn't exist.
     async fn drop_table(&self, table: &TableIdent) -> Result<()>;
 
+    /// Drop a table from the catalog and delete the underlying table data.
+    ///
+    /// Implementations should load the table metadata, drop the table
+    /// from the catalog, then delete all associated data and metadata files.
+    /// The [`drop_table_data`](utils::drop_table_data) utility function can
+    /// be used for the file cleanup step.
+    async fn purge_table(&self, table: &TableIdent) -> Result<()>;
+
     /// Check if a table exists in the catalog.
     async fn table_exists(&self, table: &TableIdent) -> Result<bool>;
 
@@ -135,13 +148,41 @@ pub trait CatalogBuilder: Default + Debug + Send + Sync {
     ///
     /// let catalog = MyCatalogBuilder::default()
     ///     .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
-    ///         configured_scheme: "s3a".to_string(),
     ///         customized_credential_load: None,
     ///     }))
     ///     .load("my_catalog", props)
     ///     .await?;
     /// ```
     fn with_storage_factory(self, storage_factory: Arc<dyn StorageFactory>) -> Self;
+
+    /// Set a [`KmsClientFactory`] to enable table encryption.
+    ///
+    /// When provided, the catalog calls the factory once during
+    /// [`load`](Self::load) with the catalog properties to create a shared
+    /// [`KeyManagementClient`](crate::encryption::KeyManagementClient).
+    /// That client is then passed to each table's `TableBuilder` so tables
+    /// with `encryption.key-id` set can construct an `EncryptionManager`.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use iceberg::CatalogBuilder;
+    /// use iceberg::encryption::kms::KmsClientFactory;
+    /// use std::sync::Arc;
+    ///
+    /// let catalog = MyCatalogBuilder::default()
+    ///     .with_kms_client_factory(Arc::new(MyKmsClientFactory))
+    ///     .load("my_catalog", props)
+    ///     .await?;
+    /// ```
+    fn with_kms_client_factory(self, kms_client_factory: Arc<dyn KmsClientFactory>) -> Self;
+
+    /// Set a custom tokio Runtime to use for spawning async tasks.
+    ///
+    /// When a Runtime is provided, the catalog will propagate it to all tables
+    /// it creates. Tasks such as scan planning and delete file processing
+    /// will be spawned on this runtime.
+    fn with_runtime(self, runtime: Runtime) -> Self;
 
     /// Create a new catalog instance.
     fn load(
@@ -387,7 +428,7 @@ impl TableCommit {
 
         let new_metadata_location = MetadataLocation::from_str(current_metadata_location)?
             .with_next_version()
-            .with_new_metadata(&new_metadata)
+            .try_with_new_metadata(&new_metadata)?
             .to_string();
 
         Ok(table
@@ -1068,6 +1109,7 @@ mod tests {
         ViewVersion,
     };
     use crate::table::Table;
+    use crate::test_utils::test_runtime;
     use crate::{
         NamespaceIdent, TableCommit, TableCreation, TableIdent, TableRequirement, TableUpdate,
     };
@@ -2382,9 +2424,10 @@ mod tests {
 
             Table::builder()
                 .metadata(resp)
-                .metadata_location("s3://bucket/test/location/metadata/00000-8a62c37d-4573-4021-952a-c0baef7d21d0.metadata.json".to_string())
+                .metadata_location("s3://bucket/test/location/metadata/00000-8a62c37d-4573-4021-952a-c0baef7d21d0.metadata.json")
                 .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
                 .file_io(FileIO::new_with_memory())
+                .runtime(test_runtime())
                 .build()
                 .unwrap()
         };
@@ -2424,12 +2467,13 @@ mod tests {
             "v2"
         );
 
-        // metadata version should be bumped
+        // metadata version should be bumped, and the metadata directory should be
+        // re-derived from the updated table location
         assert!(
             updated_table
                 .metadata_location()
                 .unwrap()
-                .starts_with("s3://bucket/test/location/metadata/00001-")
+                .starts_with("s3://bucket/test/new_location/data/metadata/00001-")
         );
 
         assert_eq!(
